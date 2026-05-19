@@ -32,10 +32,19 @@ jobs:
       run: |
         ocicl install ironclad split-sequence alexandria fiveam
 
+    - name: Setup SBCL runtime
+      run: |
+        cat > ~/.sbclrc << 'EOF'
+        ;; ocicl integration for CI
+        #-ocicl
+        (when (probe-file #P"/home/runner/.local/share/ocicl/ocicl-runtime.lisp")
+          (load #P"/home/runner/.local/share/ocicl/ocicl-runtime.lisp"))
+        (asdf:initialize-source-registry
+          (list :source-registry (list :directory (uiop:getcwd)) :inherit-configuration))
+        EOF
+
     - name: Run tests
       run: |
         sbcl --non-interactive \
-             --eval "(require :asdf)" \
-             --eval "(asdf:initialize-source-registry (list :source-registry (list :directory (uiop:getcwd)) :inherit-configuration))" \
              --eval "(asdf:load-system :mysql-login-path-parser/tests)" \
              --eval "(unless (mysql-login-path-parser.tests:run-all-tests) (quit 1))"
