@@ -21,8 +21,11 @@ jobs:
 
     - name: Install ocicl
       run: |
-        sudo apt-get update
-        sudo apt-get install -y ocicl
+        curl -fsSL https://ocicl.github.io/ocicl/deb-repo/ocicl-archive-keyring.gpg | sudo tee /usr/share/keyrings/ocicl-archive-keyring.asc > /dev/null
+        echo "deb [signed-by=/usr/share/keyrings/ocicl-archive-keyring.asc] https://ocicl.github.io/ocicl/deb-repo stable main" | sudo tee /etc/apt/sources.list.d/ocicl.list
+        sudo apt update
+        sudo apt install ocicl
+        ocicl setup
         ocicl version
 
     - name: Install dependencies
