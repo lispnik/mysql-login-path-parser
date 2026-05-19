@@ -21,12 +21,8 @@ jobs:
 
     - name: Install ocicl
       run: |
-        # Download latest release
-        RELEASE_URL=$(curl -s https://api.github.com/repos/ocicl/ocicl/releases/latest | grep "browser_download_url.*ocicl-linux" | cut -d '"' -f 4)
-        echo "Downloading ocicl from: $RELEASE_URL"
-        curl -L "$RELEASE_URL" > ocicl
-        chmod +x ocicl
-        sudo mv ocicl /usr/local/bin/
+        # Install via snap (official distribution method)
+        sudo snap install ocicl
         ocicl version
 
     - name: Install dependencies
