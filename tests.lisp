@@ -53,7 +53,7 @@
   (let ((results (run 'mysql-login-path-parser-tests)))
     (let ((total-tests (length results))
           (failed-tests (count-if-not (lambda (result)
-                                       (typep result 'test-passed))
+                                       (typep result 'fiveam:test-passed))
                                      results)))
       (format t "~%Test Results:~%")
       (format t "  Total tests: ~A~%" total-tests)
