@@ -1,6 +1,6 @@
 (defpackage #:mysql-login-path-parser.tests
   (:use #:cl #:fiveam #:mysql-login-path-parser)
-  (:export #:run-all-tests))
+  (:export #:run-mysql-tests))
 
 (in-package #:mysql-login-path-parser.tests)
 
@@ -47,7 +47,7 @@
   (signals mysql-login-path-decrypt-error
     (error 'mysql-login-path-decrypt-error :message "test")))
 
-(defun run-all-tests ()
+(defun run-mysql-tests ()
   "Run all tests and return T if all pass, NIL otherwise"
   (format t "Running MySQL login path parser tests...~%")
   (let ((results (run 'mysql-login-path-parser-tests)))

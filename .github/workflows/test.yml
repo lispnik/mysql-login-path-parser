@@ -47,4 +47,4 @@ jobs:
       run: |
         sbcl --non-interactive \
              --eval "(asdf:load-system :mysql-login-path-parser/tests)" \
-             --eval "(unless (mysql-login-path-parser.tests:run-all-tests) (quit 1))"
+             --eval "(unless (mysql-login-path-parser.tests:run-mysql-tests) (quit 1))"

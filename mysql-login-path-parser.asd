@@ -13,4 +13,4 @@
   :depends-on (#:mysql-login-path-parser #:fiveam)
   :serial t
   :components ((:file "tests"))
-  :perform (test-op (o c) (symbol-call :mysql-login-path-parser.tests :run-all-tests)))
+  :perform (test-op (o c) (symbol-call :mysql-login-path-parser.tests :run-mysql-tests)))
