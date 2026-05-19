@@ -21,8 +21,10 @@ jobs:
 
     - name: Install ocicl
       run: |
-        # Install via snap (official distribution method)
-        sudo snap install ocicl
+        # Download specific release version
+        wget https://github.com/ocicl/ocicl/releases/download/v2.16.13/ocicl-linux
+        chmod +x ocicl-linux
+        sudo mv ocicl-linux /usr/local/bin/ocicl
         ocicl version
 
     - name: Install dependencies
