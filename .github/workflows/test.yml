@@ -1,0 +1,38 @@
+name: Test
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install SBCL
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y sbcl
+        sbcl --version
+
+    - name: Install ocicl
+      run: |
+        curl -L https://github.com/ocicl/ocicl/releases/latest/download/ocicl-linux > ocicl
+        chmod +x ocicl
+        sudo mv ocicl /usr/local/bin/
+        ocicl version
+
+    - name: Install dependencies
+      run: |
+        ocicl install ironclad split-sequence alexandria fiveam
+
+    - name: Run tests
+      run: |
+        sbcl --eval "(require :asdf)" \
+             --eval "(asdf:load-system :mysql-login-path-parser/tests)" \
+             --eval "(mysql-login-path-parser.tests:run-all-tests)" \
+             --eval "(quit)"
