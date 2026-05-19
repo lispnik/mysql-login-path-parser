@@ -36,6 +36,6 @@ jobs:
       run: |
         sbcl --non-interactive \
              --eval "(require :asdf)" \
+             --eval "(push #P\".\" asdf:*central-registry*)" \
              --eval "(asdf:load-system :mysql-login-path-parser/tests)" \
-             --eval "(mysql-login-path-parser.tests:run-all-tests)" \
-             --eval "(if (mysql-login-path-parser.tests:run-all-tests) (quit 0) (quit 1))"
+             --eval "(unless (mysql-login-path-parser.tests:run-all-tests) (quit 1))"
