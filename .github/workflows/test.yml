@@ -16,12 +16,15 @@ jobs:
     - name: Install SBCL
       run: |
         sudo apt-get update
-        sudo apt-get install -y sbcl
+        sudo apt-get install -y sbcl curl
         sbcl --version
 
     - name: Install ocicl
       run: |
-        curl -L https://github.com/ocicl/ocicl/releases/latest/download/ocicl-linux > ocicl
+        # Download latest release
+        RELEASE_URL=$(curl -s https://api.github.com/repos/ocicl/ocicl/releases/latest | grep "browser_download_url.*ocicl-linux" | cut -d '"' -f 4)
+        echo "Downloading ocicl from: $RELEASE_URL"
+        curl -L "$RELEASE_URL" > ocicl
         chmod +x ocicl
         sudo mv ocicl /usr/local/bin/
         ocicl version
@@ -32,7 +35,7 @@ jobs:
 
     - name: Run tests
       run: |
-        sbcl --eval "(require :asdf)" \
+        sbcl --non-interactive \
              --eval "(asdf:load-system :mysql-login-path-parser/tests)" \
              --eval "(mysql-login-path-parser.tests:run-all-tests)" \
-             --eval "(quit)"
+             --eval "(if (mysql-login-path-parser.tests:run-all-tests) (quit 0) (quit 1))"
