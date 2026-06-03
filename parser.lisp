@@ -1,9 +1,14 @@
 (in-package #:mysql-login-path-parser)
 
 ;;; MySQL .mylogin.cnf format (from MySQL source code):
-;;; - 4 bytes unused header
-;;; - 20 bytes AES encryption key (stored in plaintext!)
-;;; - Rest is AES-128-ECB encrypted data using that key
+;;; - 4 bytes unused header (version)
+;;; - 20 bytes stored key (LOGIN_KEY_LEN)
+;;; - Then a sequence of chunks, each:
+;;;     - 4 bytes little-endian length
+;;;     - <length> bytes AES-128-ECB ciphertext (PKCS7 padded)
+;;; The 16-byte AES key is derived from the 20-byte stored key by
+;;; XOR-folding (my_aes_create_key): rkey[i mod 16] ^= key[i].
+;;; Decrypted plaintext is ordinary my.cnf-style INI text.
 
 (define-condition mysql-login-path-error (error)
   ((message :initarg :message :reader mysql-login-path-error-message))
@@ -27,10 +32,13 @@
   "Size of unused header in .mylogin.cnf")
 
 (defconstant +mysql-key-size+ 20
-  "Size of AES key in .mylogin.cnf (LOGIN_KEY_LEN from MySQL source)")
+  "Size of stored key in .mylogin.cnf (LOGIN_KEY_LEN from MySQL source)")
 
 (defconstant +mysql-total-header-size+ (+ +mysql-header-size+ +mysql-key-size+)
   "Total header size: unused header + key")
+
+(defconstant +mysql-aes-key-size+ 16
+  "AES-128 key size in bytes")
 
 (defun read-uint32-le (data offset)
   "Read 32-bit little-endian integer from byte array"
@@ -58,8 +66,19 @@
                        (subseq data start))
                   (length data))))))
 
+(defun fold-aes-key (stored-key)
+  "Fold the 20-byte stored key into a 16-byte AES-128 key via XOR.
+Mirrors MySQL's my_aes_create_key: rkey[i mod 16] ^= key[i]."
+  (let ((rkey (make-array +mysql-aes-key-size+
+                          :element-type '(unsigned-byte 8)
+                          :initial-element 0)))
+    (dotimes (i (length stored-key))
+      (let ((idx (mod i +mysql-aes-key-size+)))
+        (setf (aref rkey idx) (logxor (aref rkey idx) (aref stored-key i)))))
+    rkey))
+
 (defun read-aes-key-from-file (filepath)
-  "Extract the 20-byte AES key from .mylogin.cnf file (bytes 4-23)"
+  "Extract and fold the AES key from .mylogin.cnf into a 16-byte AES-128 key."
   (with-open-file (stream filepath :element-type '(unsigned-byte 8))
     (let ((file-length (file-length stream)))
       (when (< file-length +mysql-total-header-size+)
@@ -70,80 +89,129 @@
       (let ((header-and-key (make-array +mysql-total-header-size+
                                        :element-type '(unsigned-byte 8))))
         (read-sequence header-and-key stream)
-        (subseq header-and-key +mysql-header-size+ +mysql-total-header-size+)))))
+        (fold-aes-key (subseq header-and-key +mysql-header-size+
+                              +mysql-total-header-size+))))))
 
-(defun decrypt-mysql-data (encrypted-data aes-key)
-  "Decrypt MySQL data using AES-128-ECB with Ironclad"
+(defun strip-pkcs7-padding (data)
+  "Remove PKCS7 padding from a decrypted block. Returns DATA unchanged if the
+padding is not well-formed."
+  (let ((len (length data)))
+    (if (zerop len)
+        data
+        (let ((pad (aref data (1- len))))
+          (if (and (>= pad 1) (<= pad 16) (<= pad len))
+              (subseq data 0 (- len pad))
+              data)))))
+
+(defun decrypt-mysql-data (ciphertext aes-key)
+  "Decrypt one AES-128-ECB ciphertext chunk and strip PKCS7 padding.
+AES-KEY must be the 16-byte folded key."
   (handler-case
-      (let ((cipher (iron:make-cipher :aes :mode :ecb :key aes-key)))
-        ;; AES requires input to be multiple of 16 bytes
-        (let* ((data-length (length encrypted-data))
-               (padded-length (* (ceiling data-length 16) 16))
-               (padded-data (make-array padded-length
-                                       :element-type '(unsigned-byte 8)
-                                       :initial-element 0)))
-          ;; Copy original data
-          (replace padded-data encrypted-data)
-
-          ;; Decrypt
-          (let ((decrypted (make-array padded-length
-                                      :element-type '(unsigned-byte 8))))
-            (iron:decrypt cipher padded-data decrypted)
-            ;; Return only the original length (remove padding)
-            (subseq decrypted 0 data-length))))
+      (let ((cipher (iron:make-cipher :aes :mode :ecb :key aes-key))
+            (out (make-array (length ciphertext) :element-type '(unsigned-byte 8))))
+        (iron:decrypt cipher ciphertext out)
+        (strip-pkcs7-padding out))
     (error (e)
       (error 'mysql-login-path-decrypt-error
              :message (format nil "AES decryption failed: ~A" e)))))
 
-(defun parse-decrypted-sections (decrypted-data)
-  "Parse the decrypted data into login path sections"
-  (let ((login-paths '())
-        (pos 0))
+(defun decrypt-mylogin-text (file-data)
+  "Decrypt the chunked body of a .mylogin.cnf file into the plaintext INI string."
+  (let* ((stored-key (subseq file-data +mysql-header-size+ +mysql-total-header-size+))
+         (aes-key (fold-aes-key stored-key))
+         (len (length file-data))
+         (pos +mysql-total-header-size+)
+         (out (make-string-output-stream)))
+    (loop while (<= (+ pos 4) len)
+          do (let ((chunk-len (read-uint32-le file-data pos)))
+               (incf pos 4)
+               (when (or (null chunk-len)
+                         (zerop chunk-len)
+                         (> (+ pos chunk-len) len))
+                 (return))
+               (let ((plain (decrypt-mysql-data
+                             (subseq file-data pos (+ pos chunk-len))
+                             aes-key)))
+                 (incf pos chunk-len)
+                 (loop for b across plain do (write-char (code-char b) out)))))
+    (get-output-stream-string out)))
 
-    (loop while (< pos (- (length decrypted-data) 4))
-          do (let ((section-length (read-uint32-le decrypted-data pos)))
-               (when (and section-length
-                         (> section-length 0)
-                         (< section-length 10000)  ; Sanity check
-                         (<= (+ pos 4 section-length) (length decrypted-data)))
-                 (incf pos 4)
-                 (let ((section-end (+ pos section-length))
-                       (section-data '()))
+(defun unescape-option-value (s)
+  "Process MySQL option-file backslash escapes within S.
+Recognized: \\b \\t \\n \\r \\s (space) \\\\ \\\". A backslash before any other
+character is dropped and that character taken literally."
+  (let ((out (make-string-output-stream))
+        (len (length s))
+        (i 0))
+    (loop while (< i len)
+          for c = (char s i)
+          do (if (and (char= c #\\) (< (1+ i) len))
+                 (progn
+                   (write-char (case (char s (1+ i))
+                                 (#\b #\Backspace)
+                                 (#\t #\Tab)
+                                 (#\n #\Newline)
+                                 (#\r #\Return)
+                                 (#\s #\Space)
+                                 (#\\ #\\)
+                                 (#\" #\")
+                                 (t (char s (1+ i))))
+                               out)
+                   (incf i 2))
+                 (progn (write-char c out) (incf i))))
+    (get-output-stream-string out)))
 
-                   ;; Read key-value pairs in this section
-                   (loop while (< pos section-end)
-                         do (multiple-value-bind (key next-pos)
-                                (read-null-terminated-string decrypted-data pos)
-                              (when (and key next-pos (< next-pos section-end))
-                                (setf pos next-pos)
-                                (multiple-value-bind (value next-pos2)
-                                    (read-null-terminated-string decrypted-data pos)
-                                  (when (and value next-pos2)
-                                    (push (cons key value) section-data)
-                                    (setf pos next-pos2))))
-                              (unless (and key next-pos (> next-pos pos))
-                                (return))))
+(defun unquote-value (value)
+  "Strip a single pair of surrounding double quotes from VALUE and process
+MySQL backslash escapes within them. Unquoted values are returned literally."
+  (let ((len (length value)))
+    (if (and (>= len 2)
+             (char= (char value 0) #\")
+             (char= (char value (1- len)) #\"))
+        (unescape-option-value (subseq value 1 (1- len)))
+        value)))
 
-                   ;; Find the login path name and add to results
-                   (when section-data
-                     (let ((path-name (cdr (find "path" section-data
-                                                :test #'string= :key #'car))))
-                       (when (and path-name (> (length path-name) 0))
-                         (push (cons path-name
-                                    (remove-if (lambda (pair)
-                                                (string= (car pair) "path"))
-                                              section-data))
-                               login-paths))))
-
-                   ;; Move to next section
-                   (setf pos section-end)))
-               (unless section-length
-                 (return))))
-
-    (nreverse login-paths)))
+(defun parse-ini-text (text)
+  "Parse my.cnf-style INI TEXT into login paths: a list of
+(path-name . ((key . value) ...))."
+  (let ((paths '())
+        (current-name nil)
+        (current-pairs '()))
+    (flet ((flush ()
+             (when current-name
+               (push (cons current-name (nreverse current-pairs)) paths))
+             (setf current-name nil
+                   current-pairs '())))
+      (with-input-from-string (stream text)
+        (loop for line = (read-line stream nil nil)
+              while line
+              do (let* ((trimmed (string-trim '(#\Space #\Tab #\Return #\Newline) line))
+                        (tlen (length trimmed)))
+                   (cond
+                     ((zerop tlen) nil)
+                     ;; Comments
+                     ((member (char trimmed 0) '(#\# #\;)) nil)
+                     ;; Section header [name]
+                     ((and (char= (char trimmed 0) #\[)
+                           (char= (char trimmed (1- tlen)) #\]))
+                      (flush)
+                      (setf current-name (subseq trimmed 1 (1- tlen))))
+                     ;; key = value
+                     (t
+                      (let ((eq-pos (position #\= trimmed)))
+                        (when (and eq-pos current-name)
+                          (let ((key (string-trim '(#\Space #\Tab)
+                                                  (subseq trimmed 0 eq-pos)))
+                                (val (unquote-value
+                                      (string-trim '(#\Space #\Tab)
+                                                   (subseq trimmed (1+ eq-pos))))))
+                            (push (cons key val) current-pairs)))))))))
+      (flush))
+    (nreverse paths)))
 
 (defun parse-mylogin-cnf (filepath)
-  "Parse MySQL .mylogin.cnf file using native AES decryption"
+  "Parse MySQL .mylogin.cnf file using native AES decryption.
+Returns a list of (path-name . ((key . value) ...))."
   (handler-case
       (progn
         (unless (probe-file filepath)
@@ -154,22 +222,16 @@
           (let* ((file-length (file-length stream))
                  (file-data (make-array file-length :element-type '(unsigned-byte 8))))
 
-            ;; Read entire file
             (read-sequence file-data stream)
 
             (when (< file-length +mysql-total-header-size+)
               (error 'mysql-login-path-parse-error
                      :message "File too small to contain valid MySQL login data"))
 
-            (let* ((aes-key (subseq file-data +mysql-header-size+ +mysql-total-header-size+))
-                   (encrypted-data (subseq file-data +mysql-total-header-size+)))
+            (when (= file-length +mysql-total-header-size+)
+              (return-from parse-mylogin-cnf '()))  ; Header only, no entries
 
-              (when (zerop (length encrypted-data))
-                (return-from parse-mylogin-cnf '()))  ; Empty file
-
-              ;; Decrypt and parse
-              (let ((decrypted-data (decrypt-mysql-data encrypted-data aes-key)))
-                (parse-decrypted-sections decrypted-data))))))
+            (parse-ini-text (decrypt-mylogin-text file-data)))))
 
     (mysql-login-path-error (e)
       ;; Re-raise our own errors
