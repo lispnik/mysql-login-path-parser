@@ -105,6 +105,282 @@
   "The folded AES key extracted from a real file is 16 bytes"
   (is (= 16 (length (read-aes-key-from-file (fixture "basic"))))))
 
+(test test-parse-unicode-fixture
+  "Non-ASCII credentials written by mysql_config_editor are read back intact.
+mysql_config_editor stores the plaintext as UTF-8, so decoding it byte-by-byte
+would yield mojibake here."
+  (let ((unicode (field (parse-mylogin-cnf (fixture "unicode")) "unicode")))
+    (is (string= "café" (field unicode "user")))
+    (is (string= "pä55wörd" (field unicode "password")))))
+
+;;; --- Synthetic-image tests for the decryption layer ---------------------
+;;;
+;;; These build a .mylogin.cnf image in memory rather than shelling out to
+;;; mysql_config_editor, so they can cover inputs it will never produce
+;;; (non-ASCII credentials, corrupt chunks).
+
+(defun encrypt-chunk (plain-bytes aes-key)
+  "AES-128-ECB encrypt PLAIN-BYTES with PKCS7 padding, as mysql_config_editor does."
+  (let* ((pad (- 16 (mod (length plain-bytes) 16)))
+         (padded (concatenate '(vector (unsigned-byte 8))
+                              plain-bytes
+                              (make-array pad :element-type '(unsigned-byte 8)
+                                              :initial-element pad)))
+         (out (make-array (length padded) :element-type '(unsigned-byte 8)))
+         (cipher (ironclad:make-cipher :aes :mode :ecb :key aes-key)))
+    (ironclad:encrypt cipher padded out)
+    out))
+
+(defun synthetic-mylogin (lines)
+  "Build an in-memory .mylogin.cnf image whose body is LINES, one chunk each."
+  (let* ((stored-key (coerce (loop for i below 20 collect (mod (* i 7) 256))
+                             '(vector (unsigned-byte 8))))
+         (aes-key (mysql-login-path-parser::fold-aes-key stored-key))
+         (out (make-array 0 :element-type '(unsigned-byte 8)
+                            :adjustable t :fill-pointer t)))
+    (dotimes (i 4) (vector-push-extend 0 out))          ; unused version header
+    (loop for b across stored-key do (vector-push-extend b out))
+    (dolist (line lines)
+      (let ((ct (encrypt-chunk (babel:string-to-octets (format nil "~A~%" line)
+                                                       :encoding :utf-8)
+                               aes-key)))
+        (dotimes (k 4)                                   ; 4-byte LE length
+          (vector-push-extend (ldb (byte 8 (* 8 k)) (length ct)) out))
+        (loop for b across ct do (vector-push-extend b out))))
+    (coerce out '(simple-array (unsigned-byte 8) (*)))))
+
+(test test-utf8-plaintext
+  "Non-ASCII user names and passwords survive decryption intact.
+The plaintext is UTF-8; decoding it byte-by-byte would mangle them."
+  (let* ((image (synthetic-mylogin '("[unicode]"
+                                     "user = café"
+                                     "password = pä55wörd")))
+         (unicode (field (mysql-login-path-parser::parse-ini-text
+                          (mysql-login-path-parser::decrypt-mylogin-text image))
+                         "unicode")))
+    (is (string= "café" (field unicode "user")))
+    (is (string= "pä55wörd" (field unicode "password")))))
+
+(test test-decrypt-rejects-partial-block
+  "A chunk that is not a whole number of AES blocks is rejected, not half-decrypted"
+  (let ((key (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (signals mysql-login-path-decrypt-error
+      (decrypt-mysql-data (make-array 20 :element-type '(unsigned-byte 8)
+                                         :initial-element 0)
+                          key))
+    (signals mysql-login-path-decrypt-error
+      (decrypt-mysql-data (make-array 0 :element-type '(unsigned-byte 8)) key))))
+
+(test test-strip-pkcs7-padding-validates-all-bytes
+  "Every padding byte must agree with the count, not just the last one"
+  (is (equalp #(65 66)
+              (mysql-login-path-parser::strip-pkcs7-padding
+               (coerce #(65 66 2 2) '(vector (unsigned-byte 8))))))
+  ;; Last byte says 3, but the preceding bytes are not 3 -- previously this
+  ;; silently discarded "AB" instead of reporting the corruption.
+  (signals mysql-login-path-decrypt-error
+    (mysql-login-path-parser::strip-pkcs7-padding
+     (coerce #(65 66 3) '(vector (unsigned-byte 8)))))
+  (signals mysql-login-path-decrypt-error
+    (mysql-login-path-parser::strip-pkcs7-padding
+     (coerce #(65 66 0) '(vector (unsigned-byte 8))))))
+
+
+;;; --- Live mysql_config_editor tests ------------------------------------
+;;;
+;;; These drive MySQL's own mysql_config_editor and read back what it wrote,
+;;; so they catch format drift that the checked-in fixtures cannot. They SKIP
+;;; when the binary is not installed, which is the case on CI.
+;;;
+;;; Note that `mysql_config_editor print --all` is a raw dump of the decrypted
+;;; text, not a parse: it echoes the stored quoting and escaping verbatim. It is
+;;; therefore usable as an oracle for structure (which login paths, which keys)
+;;; but not for how a value should be unescaped.
+
+(defun mysql-config-editor-p ()
+  "True when mysql_config_editor is on PATH."
+  (handler-case
+      (zerop (nth-value 2 (uiop:run-program '("mysql_config_editor" "--version")
+                                            :ignore-error-status t
+                                            :output nil :error-output nil)))
+    (error () nil)))
+
+(defvar *temp-login-counter* 0)
+
+(defun temp-login-path ()
+  "A fresh, nonexistent pathname for a throwaway login file."
+  (let ((path (merge-pathnames (format nil "mlpp-test-~D.cnf" (incf *temp-login-counter*))
+                               (uiop:temporary-directory))))
+    (when (probe-file path)
+      (delete-file path))
+    path))
+
+(defun mce (login-file args &optional password)
+  "Run mysql_config_editor against LOGIN-FILE with ARGS, feeding PASSWORD on stdin.
+Returns its stdout."
+  (uiop:run-program (list* "env"
+                           (format nil "MYSQL_TEST_LOGIN_FILE=~A" (namestring login-file))
+                           "mysql_config_editor"
+                           args)
+                    :input (when password
+                             (make-string-input-stream (format nil "~A~%" password)))
+                    :output :string
+                    :error-output nil
+                    :ignore-error-status t))
+
+(defmacro with-live-login-file ((var) &body body)
+  "Bind VAR to a throwaway login file, skipping the test if mysql_config_editor
+is unavailable, and delete the file afterwards."
+  `(if (not (mysql-config-editor-p))
+       (skip "mysql_config_editor is not installed")
+       (let ((,var (temp-login-path)))
+         (unwind-protect (progn ,@body)
+           (ignore-errors (delete-file ,var))))))
+
+(test test-live-round-trip
+  "Values written by mysql_config_editor come back out of the parser unchanged"
+  (with-live-login-file (path)
+    (mce path '("set" "--login-path=rt" "--user=round tripper"
+                "--host=example.test" "--port=3399" "--password")
+         "p@ss w\"rd=with#stuff")
+    (let ((creds (get-login-path-credentials "rt" path)))
+      (is (string= "round tripper" (field creds "user")))
+      (is (string= "example.test" (field creds "host")))
+      (is (string= "3399" (field creds "port")))
+      ;; The embedded quote is stored escaped as \" and must survive; the '='
+      ;; and '#' must not be mistaken for a separator or a comment.
+      (is (string= "p@ss w\"rd=with#stuff" (field creds "password"))))))
+
+(test test-live-unicode-round-trip
+  "Non-ASCII credentials survive a live mysql_config_editor round trip"
+  (with-live-login-file (path)
+    (mce path '("set" "--login-path=u" "--user=Ünicode Üser" "--password")
+         "pä55wörd-日本語")
+    (let ((creds (get-login-path-credentials "u" path)))
+      (is (string= "Ünicode Üser" (field creds "user")))
+      (is (string= "pä55wörd-日本語" (field creds "password"))))))
+
+(test test-live-path-names-match-print
+  "The login paths we find match the [sections] mysql_config_editor prints"
+  (with-live-login-file (path)
+    (mce path '("set" "--login-path=alpha" "--user=a"))
+    (mce path '("set" "--login-path=beta" "--user=b"))
+    (mce path '("set" "--login-path=gamma" "--user=c"))
+    (let ((printed (loop for line in (uiop:split-string (mce path '("print" "--all"))
+                                                        :separator '(#\Newline))
+                         for trimmed = (string-trim '(#\Space #\Tab #\Return) line)
+                         when (and (> (length trimmed) 1)
+                                   (char= (char trimmed 0) #\[)
+                                   (char= (char trimmed (1- (length trimmed))) #\]))
+                           collect (subseq trimmed 1 (1- (length trimmed))))))
+      (is (equal '("alpha" "beta" "gamma") printed))
+      (is (equal printed (list-login-paths path))))))
+
+(defun my-print-defaults-p ()
+  "True when my_print_defaults is on PATH."
+  (handler-case
+      (zerop (nth-value 2 (uiop:run-program '("my_print_defaults" "--version")
+                                            :ignore-error-status t
+                                            :output nil :error-output nil)))
+    (error () nil)))
+
+(defun mysql-parsed-options (login-file login-path)
+  "Read LOGIN-PATH out of LOGIN-FILE through MySQL's *own* option parser.
+Returns ((key . value) ...). --show is what makes this a complete oracle: without
+it my_print_defaults masks passwords, the one field most worth checking."
+  (loop for line in (uiop:split-string
+                     (uiop:run-program (list "env"
+                                             (format nil "MYSQL_TEST_LOGIN_FILE=~A"
+                                                     (namestring login-file))
+                                             "my_print_defaults" "--show"
+                                             (format nil "--login-path=~A" login-path)
+                                             login-path)
+                                       :output :string :error-output nil
+                                       :ignore-error-status t)
+                     :separator '(#\Newline))
+        for trimmed = (string-trim '(#\Space #\Tab #\Return) line)
+        when (and (> (length trimmed) 2) (string= "--" (subseq trimmed 0 2)))
+          collect (let* ((body (subseq trimmed 2))
+                         (eq-pos (position #\= body)))
+                    (if eq-pos
+                        (cons (subseq body 0 eq-pos) (subseq body (1+ eq-pos)))
+                        (cons body "")))))
+
+(defun sorted-pairs (alist)
+  (sort (copy-list alist) #'string< :key #'car))
+
+(test test-live-fixtures-match-my-print-defaults
+  "Every fixture parses to exactly what MySQL's own option parser reports.
+This is the real differential test: my_print_defaults runs the same option-file
+code the mysql client does, so agreement here means our unescaping matches
+MySQL's, not merely the docs' description of it."
+  (if (not (my-print-defaults-p))
+      (skip "my_print_defaults is not installed")
+      (dolist (name '("basic" "single" "special" "unicode"))
+        (let ((file (fixture name)))
+          (dolist (login-path (list-login-paths file))
+            (is (equal (sorted-pairs (mysql-parsed-options file login-path))
+                       (sorted-pairs (get-login-path-credentials login-path file)))
+                "~A/~A: MySQL reads ~S, we read ~S"
+                name login-path
+                (sorted-pairs (mysql-parsed-options file login-path))
+                (sorted-pairs (get-login-path-credentials login-path file))))))))
+
+(test test-live-escaping-matches-mysql
+  "Backslash escapes are resolved the same way MySQL resolves them.
+mysql_config_editor escapes a literal \" on write but not a literal \\, so a
+value like back\\slash reaches the file as back\\slash and its \\s is read as the
+escape for a space. That is lossy, but it is MySQL's loss, not ours -- and this
+test proves the agreement rather than assuming it."
+  (if (not (and (mysql-config-editor-p) (my-print-defaults-p)))
+      (skip "mysql_config_editor and my_print_defaults are both required")
+      (let ((path (temp-login-path)))
+        (unwind-protect
+             (progn
+               (mce path '("set" "--login-path=esc" "--user=back\\slash"
+                           "--host=tab	here" "--password"))
+               (let ((theirs (sorted-pairs (mysql-parsed-options path "esc")))
+                     (ours (sorted-pairs (get-login-path-credentials "esc" path))))
+                 (is (equal theirs ours) "MySQL reads ~S, we read ~S" theirs ours)
+                 ;; Pin the specific quirk: \s became a space for both readers.
+                 (is (string= "back lash" (cdr (assoc "user" ours :test #'string=))))))
+          (ignore-errors (delete-file path))))))
+
+;;; --- Truncated / corrupt file handling ---------------------------------
+
+(test test-truncated-chunk-body-signals
+  "A chunk that runs past EOF is reported, not silently dropped"
+  (let ((image (synthetic-mylogin '("[a]" "user = one" "user = two"))))
+    (signals mysql-login-path-parse-error
+      (mysql-login-path-parser::decrypt-mylogin-text
+       (subseq image 0 (- (length image) 8))))))
+
+(test test-truncated-chunk-header-signals
+  "A partial 4-byte length header is reported"
+  (let ((image (synthetic-mylogin '("[a]" "user = one"))))
+    (signals mysql-login-path-parse-error
+      (mysql-login-path-parser::decrypt-mylogin-text
+       (concatenate '(simple-array (unsigned-byte 8) (*))
+                    image
+                    (coerce #(1 0) '(vector (unsigned-byte 8))))))))
+
+(test test-truncation-yields-no-partial-results
+  "parse-mylogin-cnf never returns the login paths it managed to read before
+hitting the corruption -- callers get an error, and the convenience wrappers
+that swallow it get NIL rather than a plausible-but-short list."
+  (let* ((image (synthetic-mylogin '("[first]" "user = one" "[second]" "user = two")))
+         (truncated (subseq image 0 (- (length image) 8)))
+         (path (temp-login-path)))
+    (unwind-protect
+         (progn
+           (with-open-file (s path :direction :output :element-type '(unsigned-byte 8)
+                                   :if-exists :supersede)
+             (write-sequence truncated s))
+           (signals mysql-login-path-parse-error (parse-mylogin-cnf path))
+           (is (null (list-login-paths path)))
+           (is (null (get-login-path-credentials "first" path))))
+      (ignore-errors (delete-file path)))))
+
 ;;; --- Error / edge-case handling ----------------------------------------
 
 (test test-list-login-paths-nonexistent

@@ -29,6 +29,11 @@ export MYSQL_TEST_LOGIN_FILE="$DIR/special.cnf"
 rm -f "$MYSQL_TEST_LOGIN_FILE"
 printf 'a=b=c#"x\n' | mce set --login-path=weird --user='the user' --password
 
+# --- unicode.cnf: non-ASCII user and password (stored as UTF-8) ---------
+export MYSQL_TEST_LOGIN_FILE="$DIR/unicode.cnf"
+rm -f "$MYSQL_TEST_LOGIN_FILE"
+printf 'p\xc3\xa455w\xc3\xb6rd\n' | mce set --login-path=unicode --user='café' --password
+
 # --- empty.cnf: a valid file with no login paths ------------------------
 export MYSQL_TEST_LOGIN_FILE="$DIR/empty.cnf"
 rm -f "$MYSQL_TEST_LOGIN_FILE"
