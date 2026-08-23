@@ -3,7 +3,7 @@
   :author "Matthew Kennedy <burnsidemk@gmail.com>"
   :license "MIT"
   :version "1.0.0"
-  :depends-on (#:ironclad #:split-sequence #:alexandria)
+  :depends-on (#:ironclad #:babel)
   :serial t
   :components ((:file "package")
 	       (:file "parser"))

@@ -30,7 +30,7 @@ jobs:
 
     - name: Install dependencies
       run: |
-        ocicl install ironclad split-sequence alexandria fiveam
+        ocicl install ironclad babel fiveam
 
     - name: Setup SBCL runtime
       run: |

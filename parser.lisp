@@ -40,6 +40,9 @@
 (defconstant +mysql-aes-key-size+ 16
   "AES-128 key size in bytes")
 
+(defconstant +mysql-aes-block-size+ 16
+  "AES block size in bytes")
+
 (defun read-uint32-le (data offset)
   "Read 32-bit little-endian integer from byte array"
   (when (>= (length data) (+ offset 4))
@@ -93,48 +96,87 @@ Mirrors MySQL's my_aes_create_key: rkey[i mod 16] ^= key[i]."
                               +mysql-total-header-size+))))))
 
 (defun strip-pkcs7-padding (data)
-  "Remove PKCS7 padding from a decrypted block. Returns DATA unchanged if the
-padding is not well-formed."
+  "Remove PKCS7 padding from a decrypted block.
+Signals MYSQL-LOGIN-PATH-DECRYPT-ERROR unless every padding byte is well-formed.
+Checking all of them -- not just the last -- doubles as an integrity check that
+the AES key was derived correctly, since a wrong key yields random bytes that
+pass a last-byte-only test about 6% of the time per chunk."
   (let ((len (length data)))
-    (if (zerop len)
-        data
-        (let ((pad (aref data (1- len))))
-          (if (and (>= pad 1) (<= pad 16) (<= pad len))
-              (subseq data 0 (- len pad))
-              data)))))
+    (when (zerop len)
+      (return-from strip-pkcs7-padding data))
+    (let ((pad (aref data (1- len))))
+      (unless (and (>= pad 1) (<= pad +mysql-aes-block-size+) (<= pad len))
+        (error 'mysql-login-path-decrypt-error
+               :message (format nil "Invalid PKCS7 padding byte: ~A" pad)))
+      (loop for i from (- len pad) below len
+            unless (= (aref data i) pad)
+              do (error 'mysql-login-path-decrypt-error
+                        :message (format nil "Malformed PKCS7 padding: expected ~A at offset ~A, got ~A"
+                                         pad i (aref data i))))
+      (subseq data 0 (- len pad)))))
 
 (defun decrypt-mysql-data (ciphertext aes-key)
   "Decrypt one AES-128-ECB ciphertext chunk and strip PKCS7 padding.
 AES-KEY must be the 16-byte folded key."
+  ;; Ironclad's ECB decrypt silently processes only whole blocks, leaving the
+  ;; trailing bytes of OUT unwritten (and, per ANSI, unspecified). Reject a
+  ;; short chunk up front rather than letting that garbage into the plaintext.
+  (let ((len (length ciphertext)))
+    (unless (and (plusp len) (zerop (mod len +mysql-aes-block-size+)))
+      (error 'mysql-login-path-decrypt-error
+             :message (format nil "Ciphertext length ~A is not a positive multiple of the ~A-byte AES block size"
+                              len +mysql-aes-block-size+))))
   (handler-case
       (let ((cipher (iron:make-cipher :aes :mode :ecb :key aes-key))
             (out (make-array (length ciphertext) :element-type '(unsigned-byte 8))))
         (iron:decrypt cipher ciphertext out)
         (strip-pkcs7-padding out))
+    ;; Our own errors (bad padding) pass through unwrapped.
+    (mysql-login-path-error (e)
+      (error e))
     (error (e)
       (error 'mysql-login-path-decrypt-error
              :message (format nil "AES decryption failed: ~A" e)))))
 
 (defun decrypt-mylogin-text (file-data)
-  "Decrypt the chunked body of a .mylogin.cnf file into the plaintext INI string."
+  "Decrypt the chunked body of a .mylogin.cnf file into the plaintext INI string.
+mysql_config_editor writes the plaintext as UTF-8, so the decrypted bytes are
+accumulated and decoded as a whole -- decoding byte-by-byte would mangle any
+non-ASCII user name or password."
   (let* ((stored-key (subseq file-data +mysql-header-size+ +mysql-total-header-size+))
          (aes-key (fold-aes-key stored-key))
          (len (length file-data))
          (pos +mysql-total-header-size+)
-         (out (make-string-output-stream)))
-    (loop while (<= (+ pos 4) len)
-          do (let ((chunk-len (read-uint32-le file-data pos)))
-               (incf pos 4)
-               (when (or (null chunk-len)
-                         (zerop chunk-len)
-                         (> (+ pos chunk-len) len))
-                 (return))
-               (let ((plain (decrypt-mysql-data
-                             (subseq file-data pos (+ pos chunk-len))
-                             aes-key)))
-                 (incf pos chunk-len)
-                 (loop for b across plain do (write-char (code-char b) out)))))
-    (get-output-stream-string out)))
+         (out (make-array 0 :element-type '(unsigned-byte 8)
+                            :adjustable t :fill-pointer t)))
+    ;; A well-formed body ends exactly on a chunk boundary. Anything else --
+    ;; a partial length header, a zero length, a chunk running past EOF -- is a
+    ;; corrupt or truncated file, and is reported rather than quietly ending the
+    ;; loop with whatever was decoded so far.
+    (loop
+      (let ((remaining (- len pos)))
+        (when (zerop remaining)
+          (return))
+        (when (< remaining 4)
+          (error 'mysql-login-path-parse-error
+                 :message (format nil "Truncated chunk header at offset ~A: ~A byte(s) left, need 4"
+                                  pos remaining)))
+        (let ((chunk-len (read-uint32-le file-data pos)))
+          (incf pos 4)
+          (when (zerop chunk-len)
+            (error 'mysql-login-path-parse-error
+                   :message (format nil "Zero-length chunk at offset ~A" (- pos 4))))
+          (when (> (+ pos chunk-len) len)
+            (error 'mysql-login-path-parse-error
+                   :message (format nil "Truncated chunk at offset ~A: declared ~A bytes, only ~A available"
+                                    (- pos 4) chunk-len (- len pos))))
+          (let ((plain (decrypt-mysql-data
+                        (subseq file-data pos (+ pos chunk-len))
+                        aes-key)))
+            (incf pos chunk-len)
+            (loop for b across plain do (vector-push-extend b out))))))
+    (babel:octets-to-string (coerce out '(simple-array (unsigned-byte 8) (*)))
+                            :encoding :utf-8 :errorp nil)))
 
 (defun unescape-option-value (s)
   "Process MySQL option-file backslash escapes within S.
@@ -143,22 +185,24 @@ character is dropped and that character taken literally."
   (let ((out (make-string-output-stream))
         (len (length s))
         (i 0))
+    ;; NB: a `for c = ...` variable-clause after `while` is non-conforming
+    ;; (ANSI requires variable-clauses first), so bind C in the body instead.
     (loop while (< i len)
-          for c = (char s i)
-          do (if (and (char= c #\\) (< (1+ i) len))
-                 (progn
-                   (write-char (case (char s (1+ i))
-                                 (#\b #\Backspace)
-                                 (#\t #\Tab)
-                                 (#\n #\Newline)
-                                 (#\r #\Return)
-                                 (#\s #\Space)
-                                 (#\\ #\\)
-                                 (#\" #\")
-                                 (t (char s (1+ i))))
-                               out)
-                   (incf i 2))
-                 (progn (write-char c out) (incf i))))
+          do (let ((c (char s i)))
+               (if (and (char= c #\\) (< (1+ i) len))
+                   (progn
+                     (write-char (case (char s (1+ i))
+                                   (#\b #\Backspace)
+                                   (#\t #\Tab)
+                                   (#\n #\Newline)
+                                   (#\r #\Return)
+                                   (#\s #\Space)
+                                   (#\\ #\\)
+                                   (#\" #\")
+                                   (t (char s (1+ i))))
+                                 out)
+                     (incf i 2))
+                   (progn (write-char c out) (incf i)))))
     (get-output-stream-string out)))
 
 (defun unquote-value (value)
