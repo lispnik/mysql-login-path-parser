@@ -2,7 +2,7 @@
   :description "Native Common Lisp parser for MySQL .mylogin.cnf files"
   :author "Matthew Kennedy <burnsidemk@gmail.com>"
   :license "MIT"
-  :version "1.0.0"
+  :version "2.0.0"
   :depends-on (#:ironclad #:babel)
   :serial t
   :components ((:file "package")
