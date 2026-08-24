@@ -276,14 +276,6 @@ is unavailable, and delete the file afterwards."
       (is (equal '("alpha" "beta" "gamma") printed))
       (is (equal printed (list-login-paths path))))))
 
-(defun my-print-defaults-p ()
-  "True when my_print_defaults is on PATH."
-  (handler-case
-      (zerop (nth-value 2 (uiop:run-program '("my_print_defaults" "--version")
-                                            :ignore-error-status t
-                                            :output nil :error-output nil)))
-    (error () nil)))
-
 (defun mysql-parsed-options (login-file login-path)
   "Read LOGIN-PATH out of LOGIN-FILE through MySQL's *own* option parser.
 Returns ((key . value) ...). --show is what makes this a complete oracle: without
@@ -309,22 +301,50 @@ it my_print_defaults masks passwords, the one field most worth checking."
 (defun sorted-pairs (alist)
   (sort (copy-list alist) #'string< :key #'car))
 
+(defun fixture-copy-0600 (name)
+  "Copy fixture NAME to a temp file that only the current user can read.
+MySQL's own tools silently ignore a .mylogin.cnf that is readable by anyone
+else -- they emit a warning, produce no output, and still exit 0. git does not
+preserve the 0600 mode mysql_config_editor creates, so a fresh checkout has
+0644 and the oracle reads nothing. Always hand the tools a copy, never the
+fixture in the working tree."
+  (let ((dest (temp-login-path)))
+    (uiop:copy-file (fixture name) dest)
+    (uiop:run-program (list "chmod" "600" (namestring dest))
+                      :ignore-error-status t :output nil :error-output nil)
+    dest))
+
+(defun my-print-defaults-usable-p ()
+  "True when my_print_defaults is present AND can actually read a login file.
+Presence on PATH is not sufficient, and neither is exit status: when it refuses
+a file it still exits 0. The only reliable probe is whether a fixture we know
+has content yields any."
+  (handler-case
+      (let ((probe (fixture-copy-0600 "single")))
+        (unwind-protect
+             (not (null (mysql-parsed-options probe "client")))
+          (ignore-errors (delete-file probe))))
+    (error () nil)))
+
 (test test-live-fixtures-match-my-print-defaults
   "Every fixture parses to exactly what MySQL's own option parser reports.
 This is the real differential test: my_print_defaults runs the same option-file
 code the mysql client does, so agreement here means our unescaping matches
 MySQL's, not merely the docs' description of it."
-  (if (not (my-print-defaults-p))
-      (skip "my_print_defaults is not installed")
+  (if (not (my-print-defaults-usable-p))
+      (skip "my_print_defaults cannot read login files here")
       (dolist (name '("basic" "single" "special" "unicode"))
-        (let ((file (fixture name)))
-          (dolist (login-path (list-login-paths file))
-            (is (equal (sorted-pairs (mysql-parsed-options file login-path))
-                       (sorted-pairs (get-login-path-credentials login-path file)))
-                "~A/~A: MySQL reads ~S, we read ~S"
-                name login-path
-                (sorted-pairs (mysql-parsed-options file login-path))
-                (sorted-pairs (get-login-path-credentials login-path file))))))))
+        (let ((file (fixture-copy-0600 name)))
+          (unwind-protect
+               (dolist (login-path (list-login-paths file))
+                 (let ((theirs (sorted-pairs (mysql-parsed-options file login-path)))
+                       (ours (sorted-pairs (get-login-path-credentials login-path file))))
+                   ;; Require a non-empty oracle: an empty reading means MySQL
+                   ;; declined the file, and comparing against it would pass
+                   ;; vacuously for a login path that has no fields.
+                   (is (and theirs (equal theirs ours))
+                       "~A/~A: MySQL reads ~S, we read ~S" name login-path theirs ours)))
+            (ignore-errors (delete-file file)))))))
 
 (test test-live-escaping-matches-mysql
   "Backslash escapes are resolved the same way MySQL resolves them.
@@ -332,7 +352,7 @@ mysql_config_editor escapes a literal \" on write but not a literal \\, so a
 value like back\\slash reaches the file as back\\slash and its \\s is read as the
 escape for a space. That is lossy, but it is MySQL's loss, not ours -- and this
 test proves the agreement rather than assuming it."
-  (if (not (and (mysql-config-editor-p) (my-print-defaults-p)))
+  (if (not (and (mysql-config-editor-p) (my-print-defaults-usable-p)))
       (skip "mysql_config_editor and my_print_defaults are both required")
       (let ((path (temp-login-path)))
         (unwind-protect
