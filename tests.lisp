@@ -103,7 +103,7 @@
 
 (test test-read-aes-key-from-file
   "The folded AES key extracted from a real file is 16 bytes"
-  (is (= 16 (length (read-aes-key-from-file (fixture "basic"))))))
+  (is (= 16 (length (mysql-login-path-parser::read-aes-key-from-file (fixture "basic"))))))
 
 (test test-parse-unicode-fixture
   "Non-ASCII credentials written by mysql_config_editor are read back intact.
@@ -165,11 +165,13 @@ The plaintext is UTF-8; decoding it byte-by-byte would mangle them."
   "A chunk that is not a whole number of AES blocks is rejected, not half-decrypted"
   (let ((key (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
     (signals mysql-login-path-decrypt-error
-      (decrypt-mysql-data (make-array 20 :element-type '(unsigned-byte 8)
-                                         :initial-element 0)
-                          key))
+      (mysql-login-path-parser::decrypt-mysql-data
+       (make-array 20 :element-type '(unsigned-byte 8) :initial-element 0)
+       key))
     (signals mysql-login-path-decrypt-error
-      (decrypt-mysql-data (make-array 0 :element-type '(unsigned-byte 8)) key))))
+      (mysql-login-path-parser::decrypt-mysql-data
+       (make-array 0 :element-type '(unsigned-byte 8))
+       key))))
 
 (test test-strip-pkcs7-padding-validates-all-bytes
   "Every padding byte must agree with the count, not just the last one"

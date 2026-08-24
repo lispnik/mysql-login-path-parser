@@ -36,6 +36,12 @@ CI (`.github/workflows/test.yml`) reproduces this on Ubuntu/SBCL and fails the b
 2. `decrypt-mylogin-text` — the body is a sequence of chunks, each a 4-byte little-endian length followed by that many bytes of AES-128-**ECB** ciphertext. Each chunk is decrypted independently and PKCS7-unpadded. `decrypt-mysql-data` rejects a chunk that is not a whole number of 16-byte blocks (ironclad's ECB decrypt would otherwise silently leave the trailing bytes unwritten), and `strip-pkcs7-padding` validates *every* padding byte — that check doubles as the only integrity signal that the key folding was right. The concatenated plaintext is **UTF-8** and is decoded as a whole via babel; decoding byte-by-byte mangles non-ASCII credentials.
 3. `parse-ini-text` → `unquote-value` → `unescape-option-value` — INI sections become `(path-name . ((key . value) ...))` alists. Values keep `=` and `#` literally; only a *fully* surrounding pair of double quotes is stripped, and MySQL option-file backslash escapes (`\b \t \n \r \s \\ \"`) are processed inside quotes only.
 
+## Public API
+
+Exported: `parse-mylogin-cnf`, `get-login-path-credentials`, `list-login-paths`, and the three conditions. Everything else — key folding, chunk decryption, PKCS7 handling, INI parsing — is internal and reachable only via `mysql-login-path-parser::`, which is how the tests get at it.
+
+Keep the surface this narrow. 1.x also exported `read-aes-key-from-file` and `decrypt-mysql-data`, which could not even be composed: the former returned the raw 20-byte stored key and ironclad accepts only 16, 24 or 32-byte AES keys. 2.0.0 dropped them rather than continue to publish a pipeline whose stages only make sense to this file.
+
 ## Error-handling contract
 
 Two deliberately different layers, do not collapse them:
