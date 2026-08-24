@@ -38,7 +38,7 @@ CI (`.github/workflows/test.yml`) reproduces this on Ubuntu/SBCL and fails the b
 
 ## Public API
 
-Exported: `parse-mylogin-cnf`, `get-login-path-credentials`, `list-login-paths`, and the three conditions. Everything else — key folding, chunk decryption, PKCS7 handling, INI parsing — is internal and reachable only via `mysql-login-path-parser::`, which is how the tests get at it.
+Exported: `parse-mylogin-cnf`, `get-login-path-credentials`, `list-login-paths`, the three conditions, and `mysql-login-path-error-message` for reading a signalled condition's text. Everything else — key folding, chunk decryption, PKCS7 handling, INI parsing — is internal and reachable only via `mysql-login-path-parser::`, which is how the tests get at it.
 
 Keep the surface this narrow. 1.x also exported `read-aes-key-from-file` and `decrypt-mysql-data`, which could not even be composed: the former returned the raw 20-byte stored key and ironclad accepts only 16, 24 or 32-byte AES keys. 2.0.0 dropped them rather than continue to publish a pipeline whose stages only make sense to this file.
 

@@ -420,6 +420,16 @@ that swallow it get NIL rather than a plausible-but-short list."
   (signals mysql-login-path-parse-error
     (parse-mylogin-cnf "/nonexistent/file")))
 
+(test test-error-message-reader-is-exported
+  "A caller can read a signalled condition's message through the exported
+reader. Referring to it unqualified here is itself the check that it is
+external, since this package only :uses mysql-login-path-parser."
+  (handler-case
+      (progn (parse-mylogin-cnf "/nonexistent/file")
+             (is nil "expected parse-mylogin-cnf to signal"))
+    (mysql-login-path-error (e)
+      (is (search "File not found" (mysql-login-path-error-message e))))))
+
 (test test-conditions
   "Test that custom conditions are defined"
   (signals mysql-login-path-error
